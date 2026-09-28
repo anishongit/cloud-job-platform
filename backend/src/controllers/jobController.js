@@ -10,7 +10,6 @@ const createJob = async (req, res) => {
 
         const { type, priority } = req.body;
 
-        // Validate input
         if (
             typeof type !== "string" ||
             !type.trim() ||
@@ -23,18 +22,25 @@ const createJob = async (req, res) => {
             });
         }
 
-        // Insert job into database
+        const userId = req.user.id;
+
         const [result] = await pool.execute(
-            `INSERT INTO jobs (type, priority, status)
-             VALUES (?, ?, ?)`,
-            [type.trim(), priority, "QUEUED"]
+            `INSERT INTO jobs
+             (user_id, type, priority, status)
+             VALUES (?, ?, ?, ?)`,
+            [
+                userId,
+                type.trim(),
+                priority,
+                "QUEUED"
+            ]
         );
 
-        // Send response
         return res.status(201).json({
             job_id: result.insertId,
+            user_id: userId,
             type: type.trim(),
-            priority: priority,
+            priority,
             status: "QUEUED"
         });
 
@@ -50,22 +56,27 @@ const createJob = async (req, res) => {
 
 
 // ======================================================
-// GET ALL JOBS
+// GET ALL JOBS FOR CURRENT USER
 // ======================================================
 
 const getJobs = async (req, res) => {
 
     try {
 
+        const userId = req.user.id;
+
         const [rows] = await pool.execute(
             `SELECT
                 id,
+                user_id,
                 type,
                 priority,
                 status,
                 created_at
              FROM jobs
-             ORDER BY created_at DESC`
+             WHERE user_id = ?
+             ORDER BY created_at DESC`,
+            [userId]
         );
 
         return res.status(200).json(rows);
@@ -82,7 +93,7 @@ const getJobs = async (req, res) => {
 
 
 // ======================================================
-// GET JOB BY ID
+// GET SINGLE JOB FOR CURRENT USER
 // ======================================================
 
 const getJobById = async (req, res) => {
@@ -90,31 +101,29 @@ const getJobById = async (req, res) => {
     try {
 
         const id = Number(req.params.id);
+        const userId = req.user.id;
 
-        // Validate ID
         if (!Number.isInteger(id) || id <= 0) {
-
             return res.status(400).json({
                 message: "Invalid job ID"
             });
         }
 
-        // Find job
         const [rows] = await pool.execute(
             `SELECT
                 id,
+                user_id,
                 type,
                 priority,
                 status,
                 created_at
              FROM jobs
-             WHERE id = ?`,
-            [id]
+             WHERE id = ?
+             AND user_id = ?`,
+            [id, userId]
         );
 
-        // Job doesn't exist
         if (rows.length === 0) {
-
             return res.status(404).json({
                 message: "Job not found"
             });
@@ -132,10 +141,6 @@ const getJobById = async (req, res) => {
     }
 };
 
-
-// ======================================================
-// EXPORT FUNCTIONS
-// ======================================================
 
 module.exports = {
     createJob,

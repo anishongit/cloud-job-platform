@@ -1,4 +1,3 @@
-
 const express = require("express");
 
 const {
@@ -7,10 +6,14 @@ const {
     getJobById
 } = require("../controllers/jobController");
 
+const authenticateToken = require("../middleware/authMiddleware");
+
 const router = express.Router();
 
-router.post("/", createJob);
-router.get("/", getJobs);
-router.get("/:id", getJobById);
+router.post("/", authenticateToken, createJob);
+
+router.get("/", authenticateToken, getJobs);
+
+router.get("/:id", authenticateToken, getJobById);
 
 module.exports = router;
