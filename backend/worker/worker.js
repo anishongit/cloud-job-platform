@@ -15,39 +15,74 @@ const processJob = async (job) => {
     console.log(`Priority: ${job.priority}`);
     console.log("--------------------------------");
 
-    // Simulate processing
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Simulate a 5-second job
+    await new Promise(resolve =>
+        setTimeout(resolve, 5000)
+    );
 
     console.log(`Job ${job.id} completed`);
-
 };
 
 
 // ======================================================
-// GET NEXT JOB
+// CLAIM NEXT JOB
 // ======================================================
 
-const getNextJob = async () => {
+const claimNextJob = async () => {
 
-    const [rows] = await pool.execute(
-        `SELECT
-            id,
-            user_id,
-            type,
-            priority,
-            status,
-            created_at
-         FROM jobs
-         WHERE status = 'QUEUED'
-         ORDER BY priority DESC, created_at ASC
-         LIMIT 1`
-    );
+    const connection = await pool.getConnection();
 
-    if (rows.length === 0) {
-        return null;
+    try {
+
+        await connection.beginTransaction();
+
+        const [rows] = await connection.execute(
+            `SELECT
+                id,
+                user_id,
+                type,
+                priority,
+                status,
+                created_at
+             FROM jobs
+             WHERE status = 'QUEUED'
+             ORDER BY priority DESC, created_at ASC
+             LIMIT 1
+             FOR UPDATE`
+        );
+
+        if (rows.length === 0) {
+
+            await connection.rollback();
+
+            connection.release();
+
+            return null;
+        }
+
+        const job = rows[0];
+
+        await connection.execute(
+            `UPDATE jobs
+             SET status = 'PROCESSING'
+             WHERE id = ?`,
+            [job.id]
+        );
+
+        await connection.commit();
+
+        connection.release();
+
+        return job;
+
+    } catch (error) {
+
+        await connection.rollback();
+
+        connection.release();
+
+        throw error;
     }
-
-    return rows[0];
 };
 
 
@@ -64,7 +99,7 @@ const startWorker = async () => {
 
         try {
 
-            const job = await getNextJob();
+            const job = await claimNextJob();
 
             if (!job) {
 
@@ -75,24 +110,19 @@ const startWorker = async () => {
                 continue;
             }
 
-            // Mark job as processing
-            await pool.execute(
-                `UPDATE jobs
-                 SET status = 'PROCESSING'
-                 WHERE id = ?`,
-                [job.id]
-            );
-
             try {
 
                 await processJob(job);
 
-                // Mark completed
                 await pool.execute(
                     `UPDATE jobs
                      SET status = 'COMPLETED'
                      WHERE id = ?`,
                     [job.id]
+                );
+
+                console.log(
+                    `Job ${job.id} marked as COMPLETED`
                 );
 
             } catch (error) {
