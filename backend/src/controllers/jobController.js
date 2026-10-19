@@ -1,13 +1,10 @@
+
 const pool = require("../config/db");
 
-// ======================================================
-// CREATE JOB
-// ======================================================
-
 const createJob = async (req, res) => {
+    let connection;
 
     try {
-
         const { type, priority } = req.body;
 
         if (
@@ -24,55 +21,59 @@ const createJob = async (req, res) => {
 
         const userId = req.user.id;
 
-        const [result] = await pool.execute(
-            `INSERT INTO jobs
-             (user_id, type, priority, status)
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+
+        const [result] = await connection.execute(
+            `INSERT INTO jobs (user_id, type, priority, status)
              VALUES (?, ?, ?, ?)`,
-            [
-                userId,
-                type.trim(),
-                priority,
-                "QUEUED"
-            ]
+            [userId, type.trim(), priority, "QUEUED"]
         );
 
+        const jobId = result.insertId;
+
+        await connection.execute(
+            `INSERT INTO job_outbox (job_id, event_type)
+             VALUES (?, ?)`,
+            [jobId, "JOB_CREATED"]
+        );
+
+        await connection.commit();
+
         return res.status(201).json({
-            job_id: result.insertId,
+            job_id: jobId,
             user_id: userId,
             type: type.trim(),
             priority,
             status: "QUEUED"
         });
-
     } catch (error) {
+        if (connection) {
+            try {
+                await connection.rollback();
+            } catch (rollbackError) {
+                console.error("Rollback failed:", rollbackError.message);
+            }
+        }
 
         console.error("Error creating job:", error);
 
         return res.status(500).json({
             message: "Failed to create job"
         });
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 };
 
-
-// ======================================================
-// GET ALL JOBS FOR CURRENT USER
-// ======================================================
-
 const getJobs = async (req, res) => {
-
     try {
-
         const userId = req.user.id;
 
         const [rows] = await pool.execute(
-            `SELECT
-                id,
-                user_id,
-                type,
-                priority,
-                status,
-                created_at
+            `SELECT id, user_id, type, priority, status, created_at
              FROM jobs
              WHERE user_id = ?
              ORDER BY created_at DESC`,
@@ -80,9 +81,7 @@ const getJobs = async (req, res) => {
         );
 
         return res.status(200).json(rows);
-
     } catch (error) {
-
         console.error("Error fetching jobs:", error);
 
         return res.status(500).json({
@@ -91,15 +90,8 @@ const getJobs = async (req, res) => {
     }
 };
 
-
-// ======================================================
-// GET SINGLE JOB FOR CURRENT USER
-// ======================================================
-
 const getJobById = async (req, res) => {
-
     try {
-
         const id = Number(req.params.id);
         const userId = req.user.id;
 
@@ -110,16 +102,9 @@ const getJobById = async (req, res) => {
         }
 
         const [rows] = await pool.execute(
-            `SELECT
-                id,
-                user_id,
-                type,
-                priority,
-                status,
-                created_at
+            `SELECT id, user_id, type, priority, status, created_at
              FROM jobs
-             WHERE id = ?
-             AND user_id = ?`,
+             WHERE id = ? AND user_id = ?`,
             [id, userId]
         );
 
@@ -130,9 +115,7 @@ const getJobById = async (req, res) => {
         }
 
         return res.status(200).json(rows[0]);
-
     } catch (error) {
-
         console.error("Error fetching job:", error);
 
         return res.status(500).json({
@@ -140,7 +123,6 @@ const getJobById = async (req, res) => {
         });
     }
 };
-
 
 module.exports = {
     createJob,

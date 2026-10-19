@@ -64,8 +64,11 @@ const claimNextJob = async () => {
 
         await connection.execute(
             `UPDATE jobs
-             SET status = 'PROCESSING'
-             WHERE id = ?`,
+SET
+    status = 'PROCESSING',
+    attempts = attempts + 1,
+    started_at = CURRENT_TIMESTAMP
+WHERE id = ?`,
             [job.id]
         );
 
@@ -116,8 +119,10 @@ const startWorker = async () => {
 
                 await pool.execute(
                     `UPDATE jobs
-                     SET status = 'COMPLETED'
-                     WHERE id = ?`,
+SET
+    status = 'COMPLETED',
+    completed_at = CURRENT_TIMESTAMP
+WHERE id = ?`,
                     [job.id]
                 );
 
