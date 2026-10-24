@@ -1,4 +1,5 @@
 
+const { randomUUID } = require("crypto");
 const pool = require("../src/config/db");
 const {
     redisClient,
@@ -10,14 +11,13 @@ const QUEUE_NAME = "job_queue";
 const PROCESSING_QUEUE = "job_processing";
 
 const MAX_ATTEMPTS = 3;
-const STUCK_JOB_TIMEOUT_SECONDS = 60;
+const LEASE_DURATION_SECONDS = 30;
+const LEASE_RENEW_INTERVAL_MS = 10000;
 
-// Wait between polling attempts
 const sleep = (ms) =>
     new Promise((resolve) => setTimeout(resolve, ms));
 
-// Atomically move the highest-priority job from the queue
-// into a processing set, recording when it was claimed.
+// Move the highest-priority job into the processing set.
 const dequeueJob = async () => {
     const result = await redisClient.eval(
         `local job = redis.call('ZPOPMAX', KEYS[1], 1)
@@ -35,9 +35,10 @@ const dequeueJob = async () => {
     return result ? String(result) : null;
 };
 
-// Claim the job in MySQL so only one worker can process it.
+// Claim a queued job in MySQL and assign a unique token.
 const claimJobInDatabase = async (jobId) => {
     const connection = await pool.getConnection();
+    const claimToken = randomUUID();
 
     try {
         await connection.beginTransaction();
@@ -57,21 +58,33 @@ const claimJobInDatabase = async (jobId) => {
 
         const job = rows[0];
 
-        await connection.execute(
+        const [result] = await connection.execute(
             `UPDATE jobs
              SET status = 'PROCESSING',
                  attempts = attempts + 1,
-                 started_at = CURRENT_TIMESTAMP
-             WHERE id = ? AND status = 'QUEUED'`,
-            [jobId]
+                 started_at = CURRENT_TIMESTAMP,
+                 lease_expires_at = DATE_ADD(
+                     CURRENT_TIMESTAMP,
+                     INTERVAL ${LEASE_DURATION_SECONDS} SECOND
+                 ),
+                 claim_token = ?
+             WHERE id = ?
+               AND status = 'QUEUED'`,
+            [claimToken, jobId]
         );
+
+        if (result.affectedRows !== 1) {
+            await connection.rollback();
+            return null;
+        }
 
         await connection.commit();
 
         return {
             ...job,
             status: "PROCESSING",
-            attempts: job.attempts + 1
+            attempts: job.attempts + 1,
+            claim_token: claimToken
         };
     } catch (error) {
         await connection.rollback();
@@ -81,73 +94,182 @@ const claimJobInDatabase = async (jobId) => {
     }
 };
 
-// Replace this simulation with actual job logic later.
-const processJob = async (job) => {
-    console.log("--------------------------------");
-    console.log(`Processing Job ${job.id}`);
-    console.log(`Type: ${job.type}`);
-    console.log(`Priority: ${job.priority}`);
-    console.log("--------------------------------");
+// Renew a lease only if this worker still owns the claim.
+const renewJobLease = async (jobId, claimToken) => {
+    const [result] = await pool.execute(
+        `UPDATE jobs
+         SET lease_expires_at = DATE_ADD(
+             CURRENT_TIMESTAMP,
+             INTERVAL ${LEASE_DURATION_SECONDS} SECOND
+         )
+         WHERE id = ?
+           AND status = 'PROCESSING'
+           AND claim_token = ?
+           AND lease_expires_at > CURRENT_TIMESTAMP`,
+        [jobId, claimToken]
+    );
 
-    await sleep(5000);
-if (job.type === "test-failure") {
-    throw new Error("Simulated processing failure");
-}
-    console.log(`Job ${job.id} processing finished`);
+    return result.affectedRows === 1;
 };
 
-// Update the database and acknowledge the Redis processing entry.
-const finishJob = async (jobId, status) => {
-    await pool.execute(
+// Renew the lease sequentially while the job is processing.
+const startLeaseHeartbeat = (jobId, claimToken) => {
+    let stopped = false;
+    let renewalFailed = false;
+
+    const run = async () => {
+        while (!stopped) {
+            await sleep(LEASE_RENEW_INTERVAL_MS);
+
+            if (stopped) break;
+
+            try {
+                const renewed = await renewJobLease(
+                    jobId,
+                    claimToken
+                );
+
+                if (!renewed) {
+                    renewalFailed = true;
+                    console.error(
+                        `Lease renewal rejected for job ${jobId}`
+                    );
+                    break;
+                }
+            } catch (error) {
+                renewalFailed = true;
+                console.error(
+                    `Lease renewal error for job ${jobId}:`,
+                    error.message
+                );
+                break;
+            }
+        }
+    };
+
+    const promise = run();
+
+    return {
+        stop: () => {
+            stopped = true;
+        },
+        promise,
+        hasFailed: () => renewalFailed
+    };
+};
+
+// Simulated job execution.
+const processJob = async (job) => {
+    const heartbeat = startLeaseHeartbeat(
+        job.id,
+        job.claim_token
+    );
+
+    try {
+        console.log("--------------------------------");
+        console.log(`Processing Job ${job.id}`);
+        console.log(`Type: ${job.type}`);
+        console.log(`Priority: ${job.priority}`);
+        console.log(`Attempt: ${job.attempts}`);
+        console.log("--------------------------------");
+
+        await sleep(5000);
+
+        if (job.type === "test-failure") {
+            throw new Error("Simulated processing failure");
+        }
+
+        if (heartbeat.hasFailed()) {
+            throw new Error("Job lease could not be renewed");
+        }
+
+        console.log(`Job ${job.id} processing finished`);
+    } finally {
+        heartbeat.stop();
+        await heartbeat.promise;
+    }
+};
+
+// Complete or fail a job only if the claim token is still valid.
+const finishJob = async (jobId, status, claimToken) => {
+    const [result] = await pool.execute(
         `UPDATE jobs
          SET status = ?,
              completed_at = CASE
-                 WHEN ? = 'COMPLETED' THEN CURRENT_TIMESTAMP
+                 WHEN ? = 'COMPLETED'
+                 THEN CURRENT_TIMESTAMP
                  ELSE NULL
-             END
-         WHERE id = ? AND status = 'PROCESSING'`,
-        [status, status, jobId]
+             END,
+             lease_expires_at = NULL,
+             claim_token = NULL
+         WHERE id = ?
+           AND status = 'PROCESSING'
+           AND claim_token = ?
+           AND lease_expires_at > CURRENT_TIMESTAMP`,
+        [status, status, jobId, claimToken]
     );
 
-    await redisClient.zRem(PROCESSING_QUEUE, String(jobId));
+    if (result.affectedRows !== 1) {
+        console.error(
+            `Job ${jobId}: status update rejected; claim is no longer valid`
+        );
+        return false;
+    }
+
+    await redisClient.zRem(
+        PROCESSING_QUEUE,
+        String(jobId)
+    );
+
+    return true;
 };
+
+// Recover jobs with expired processing leases.
 const recoverStuckJobs = async () => {
     const [stuckJobs] = await pool.execute(
         `SELECT id, attempts, priority
          FROM jobs
          WHERE status = 'PROCESSING'
-           AND started_at < DATE_SUB(
-               CURRENT_TIMESTAMP,
-               INTERVAL ? SECOND
-           )`,
-        [STUCK_JOB_TIMEOUT_SECONDS]
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at < CURRENT_TIMESTAMP`
     );
 
     for (const job of stuckJobs) {
         if (job.attempts >= MAX_ATTEMPTS) {
-            await pool.execute(
+            const [result] = await pool.execute(
                 `UPDATE jobs
-                 SET status = 'FAILED'
-                 WHERE id = ? AND status = 'PROCESSING'`,
+                 SET status = 'FAILED',
+                     lease_expires_at = NULL,
+                     claim_token = NULL
+                 WHERE id = ?
+                   AND status = 'PROCESSING'
+                   AND lease_expires_at < CURRENT_TIMESTAMP`,
                 [job.id]
             );
 
-            await redisClient.zRem(
-                PROCESSING_QUEUE,
-                String(job.id)
-            );
+            if (result.affectedRows === 1) {
+                await redisClient.zRem(
+                    PROCESSING_QUEUE,
+                    String(job.id)
+                );
 
-            console.log(
-                `Job ${job.id} marked FAILED after ${job.attempts} attempts`
-            );
+                console.log(
+                    `Job ${job.id} marked FAILED after ${job.attempts} attempts`
+                );
+            }
 
             continue;
         }
 
         const [result] = await pool.execute(
             `UPDATE jobs
-             SET status = 'QUEUED', started_at = NULL
-             WHERE id = ? AND status = 'PROCESSING'`,
+             SET status = 'QUEUED',
+                 started_at = NULL,
+                 lease_expires_at = NULL,
+                 claim_token = NULL
+             WHERE id = ?
+               AND status = 'PROCESSING'
+               AND lease_expires_at < CURRENT_TIMESTAMP`,
             [job.id]
         );
 
@@ -160,16 +282,45 @@ const recoverStuckJobs = async () => {
             await redisClient.zAdd(QUEUE_NAME, [
                 {
                     score: Number(job.priority),
-                    value: String(job.id),
-                },
+                    value: String(job.id)
+                }
             ]);
 
             console.log(
-                `Recovered job ${job.id}; retry ${job.attempts + 1}`
+                `Recovered job ${job.id}; next attempt ${job.attempts + 1}`
             );
         }
     }
 };
+const reconcileQueuedJobs = async () => {
+    const [queuedJobs] = await pool.execute(
+        `SELECT id, priority
+         FROM jobs
+         WHERE status = 'QUEUED'`
+    );
+
+    for (const job of queuedJobs) {
+        const jobId = String(job.id);
+
+        const [queueScore, processingScore] = await Promise.all([
+            redisClient.zScore(QUEUE_NAME, jobId),
+            redisClient.zScore(PROCESSING_QUEUE, jobId)
+        ]);
+
+        // Don't enqueue a job already present in either set.
+        if (queueScore !== null || processingScore !== null) {
+            continue;
+        }
+
+        await redisClient.zAdd(QUEUE_NAME, [{
+            score: Number(job.priority),
+            value: jobId
+        }]);
+
+        console.log(`Reconciled queued job ${jobId}`);
+    }
+};
+// Main worker loop.
 const startWorker = async () => {
     await connectRedis();
 
@@ -177,11 +328,11 @@ const startWorker = async () => {
     console.log("Waiting for jobs...");
 
     while (true) {
-        let jobId = null;
-
         try {
             await recoverStuckJobs();
-            jobId = await dequeueJob();
+            await reconcileQueuedJobs();
+
+            const jobId = await dequeueJob();
 
             if (!jobId) {
                 await sleep(POLL_INTERVAL);
@@ -200,46 +351,72 @@ const startWorker = async () => {
             }
 
             try {
-    await processJob(job);
+                await processJob(job);
 
-    await finishJob(job.id, "COMPLETED");
-    console.log(`Job ${job.id} marked COMPLETED`);
+                const completed = await finishJob(
+                    job.id,
+                    "COMPLETED",
+                    job.claim_token
+                );
 
-} catch (error) {
-    console.error(`Job ${job.id} failed:`, error.message);
-
-    if (job.attempts < MAX_ATTEMPTS) {
-        const [result] = await pool.execute(
-            `UPDATE jobs
-             SET status = 'QUEUED',
-                 started_at = NULL
-             WHERE id = ? AND status = 'PROCESSING'`,
-            [job.id]
-        );
-
-        if (result.affectedRows === 1) {
-            await redisClient.zRem(PROCESSING_QUEUE, String(job.id));
-
-            await redisClient.zAdd(QUEUE_NAME, [
-                {
-                    score: Number(job.priority),
-                    value: String(job.id)
+                if (completed) {
+                    console.log(`Job ${job.id} marked COMPLETED`);
                 }
-            ]);
+            } catch (error) {
+                console.error(
+                    `Job ${job.id} failed:`,
+                    error.message
+                );
 
-            console.log(
-                `Job ${job.id} requeued for attempt ${job.attempts + 1}`
-            );
-        }
+                if (job.attempts < MAX_ATTEMPTS) {
+                    const [result] = await pool.execute(
+                        `UPDATE jobs
+                         SET status = 'QUEUED',
+                             started_at = NULL,
+                             lease_expires_at = NULL,
+                             claim_token = NULL
+                         WHERE id = ?
+                           AND status = 'PROCESSING'
+                           AND claim_token = ?
+                           AND lease_expires_at > CURRENT_TIMESTAMP`,
+                        [job.id, job.claim_token]
+                    );
 
-    } else {
-        await finishJob(job.id, "FAILED");
+                    if (result.affectedRows === 1) {
+                        await redisClient.zRem(
+                            PROCESSING_QUEUE,
+                            String(job.id)
+                        );
 
-        console.log(
-            `Job ${job.id} marked FAILED after ${job.attempts} attempts`
-        );
-    }
-}
+                        await redisClient.zAdd(QUEUE_NAME, [
+                            {
+                                score: Number(job.priority),
+                                value: String(job.id)
+                            }
+                        ]);
+
+                        console.log(
+                            `Job ${job.id} requeued for attempt ${job.attempts + 1}`
+                        );
+                    } else {
+                        console.log(
+                            `Job ${job.id}: retry skipped because its claim is no longer valid`
+                        );
+                    }
+                } else {
+                    const failed = await finishJob(
+                        job.id,
+                        "FAILED",
+                        job.claim_token
+                    );
+
+                    if (failed) {
+                        console.log(
+                            `Job ${job.id} marked FAILED after ${job.attempts} attempts`
+                        );
+                    }
+                }
+            }
         } catch (error) {
             console.error("Worker error:", error.message);
             await sleep(POLL_INTERVAL);
