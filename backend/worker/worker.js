@@ -18,21 +18,15 @@ const sleep = (ms) =>
     new Promise((resolve) => setTimeout(resolve, ms));
 
 // Move the highest-priority job into the processing set.
-const dequeueJob = async () => {
-    const result = await redisClient.eval(
-        `local job = redis.call('ZPOPMAX', KEYS[1], 1)
-         if #job == 0 then
-             return nil
-         end
-         redis.call('ZADD', KEYS[2], ARGV[1], job[1])
-         return job[1]`,
-        {
-            keys: [QUEUE_NAME, PROCESSING_QUEUE],
-            arguments: [String(Date.now())]
-        }
-    );
 
-    return result ? String(result) : null;
+const dequeueJob = async () => {
+    const result = await redisClient.zPopMax(QUEUE_NAME);
+
+    if (!result) {
+        return null;
+    }
+
+    return result.value;
 };
 
 // Claim a queued job in MySQL and assign a unique token.
@@ -191,6 +185,7 @@ const processJob = async (job) => {
 };
 
 // Complete or fail a job only if the claim token is still valid.
+
 const finishJob = async (jobId, status, claimToken) => {
     const [result] = await pool.execute(
         `UPDATE jobs
@@ -225,6 +220,7 @@ const finishJob = async (jobId, status, claimToken) => {
 };
 
 // Recover jobs with expired processing leases.
+
 const recoverStuckJobs = async () => {
     const [stuckJobs] = await pool.execute(
         `SELECT id, attempts, priority
@@ -235,63 +231,48 @@ const recoverStuckJobs = async () => {
     );
 
     for (const job of stuckJobs) {
-        if (job.attempts >= MAX_ATTEMPTS) {
-            const [result] = await pool.execute(
-                `UPDATE jobs
-                 SET status = 'FAILED',
-                     lease_expires_at = NULL,
-                     claim_token = NULL
-                 WHERE id = ?
-                   AND status = 'PROCESSING'
-                   AND lease_expires_at < CURRENT_TIMESTAMP`,
-                [job.id]
-            );
-
-            if (result.affectedRows === 1) {
-                await redisClient.zRem(
-                    PROCESSING_QUEUE,
-                    String(job.id)
-                );
-
-                console.log(
-                    `Job ${job.id} marked FAILED after ${job.attempts} attempts`
-                );
-            }
-
-            continue;
-        }
+        const nextStatus =
+            job.attempts >= MAX_ATTEMPTS ? "FAILED" : "QUEUED";
 
         const [result] = await pool.execute(
             `UPDATE jobs
-             SET status = 'QUEUED',
+             SET status = ?,
                  started_at = NULL,
                  lease_expires_at = NULL,
                  claim_token = NULL
              WHERE id = ?
                AND status = 'PROCESSING'
                AND lease_expires_at < CURRENT_TIMESTAMP`,
-            [job.id]
+            [nextStatus, job.id]
         );
 
-        if (result.affectedRows === 1) {
-            await redisClient.zRem(
-                PROCESSING_QUEUE,
-                String(job.id)
-            );
+        if (result.affectedRows !== 1) {
+            continue;
+        }
 
-            await redisClient.zAdd(QUEUE_NAME, [
-                {
-                    score: Number(job.priority),
-                    value: String(job.id)
-                }
-            ]);
+        // Remove the old processing entry.
+        await redisClient.zRem(
+            PROCESSING_QUEUE,
+            String(job.id)
+        );
+
+        if (nextStatus === "QUEUED") {
+            await redisClient.zAdd(QUEUE_NAME, [{
+                score: Number(job.priority),
+                value: String(job.id)
+            }]);
 
             console.log(
                 `Recovered job ${job.id}; next attempt ${job.attempts + 1}`
             );
+        } else {
+            console.log(
+                `Job ${job.id} marked FAILED after ${job.attempts} attempts`
+            );
         }
     }
 };
+
 const reconcileQueuedJobs = async () => {
     const [queuedJobs] = await pool.execute(
         `SELECT id, priority
@@ -343,12 +324,13 @@ const startWorker = async () => {
 
             // Ignore stale or duplicate queue entries.
             if (!job) {
-                await redisClient.zRem(
-                    PROCESSING_QUEUE,
-                    String(jobId)
-                );
                 continue;
             }
+
+            await redisClient.zAdd(PROCESSING_QUEUE, [{
+    score: Date.now(),
+    value: String(job.id)
+}]);
 
             try {
                 await processJob(job);
