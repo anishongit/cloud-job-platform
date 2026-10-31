@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dispatcher": "node src/queue/dispatcher.js",
+    "worker": "node worker/worker.js",
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test": "jest"
