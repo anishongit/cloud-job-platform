@@ -1,5 +1,18 @@
 {
-  "dependencies": {
-    "express-rate-limit": "^8.7.2"
+  "name": "cloud-job-platform",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "start": "npm start --workspace backend",
+    "dev": "npm run dev --workspace backend",
+    "test": "npm test --workspace backend",
+    "worker": "npm run worker --workspace backend",
+    "dispatcher": "npm run dispatcher --workspace backend",
+    "frontend": "npm run dev --workspace frontend",
+    "build:frontend": "npm run build --workspace frontend"
   }
 }
