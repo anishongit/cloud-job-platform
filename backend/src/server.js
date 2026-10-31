@@ -52,4 +52,6 @@ app.listen(PORT, () => {
 });
 
 
+// Authentication routes (must be registered before server starts listening)
 app.use("/api/auth", authRoutes);
+
