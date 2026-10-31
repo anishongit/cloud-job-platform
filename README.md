@@ -52,52 +52,52 @@ This platform implements an enterprise **Transactional Outbox Engine**:
 
 ```mermaid
 flowchart TD
-    subgraph Client ["🖥️ Presentation Layer"]
-        UI["React 18 + Vite SPA<br/>(Dashboard & Telemetry)"]
+    subgraph Client ["Client Presentation Layer"]
+        UI["React 18 and Vite SPA (Dashboard and Telemetry)"]
     end
 
-    subgraph API ["⚡ API Layer (Express.js)"]
-        Server["Express REST API<br/>(JWT Auth, Rate Limiter, Helmet)"]
-        AuthCtrl["Auth Controller<br/>(Bcrypt, Token Issuer)"]
-        JobCtrl["Job Controller<br/>(Transaction Coordinator)"]
+    subgraph API ["API Layer (Express.js)"]
+        Server["Express REST API (JWT Auth, Rate Limiter, Helmet)"]
+        AuthCtrl["Auth Controller (Bcrypt, Token Issuer)"]
+        JobCtrl["Job Controller (Transaction Coordinator)"]
     end
 
-    subgraph Storage ["💾 Persistence Layer (MySQL)"]
+    subgraph Storage ["Persistence Layer (MySQL)"]
         subgraph DBTransaction ["Atomic ACID Transaction"]
-            Jobs["`**jobs** table`<br/>(Status: QUEUED, Priority 1-10)"]
-            Outbox["`**job_outbox** table`<br/>(Event: JOB_CREATED, published_at: NULL)"]
+            Jobs["jobs table (Status: QUEUED, Priority 1-10)"]
+            Outbox["job_outbox table (Event: JOB_CREATED, published_at: NULL)"]
         end
-        Users["`**users** table`<br/>(RBAC / Ownership)"]
+        Users["users table (RBAC / Ownership)"]
     end
 
-    subgraph Broker ["⚡ In-Memory Queue (Redis / Memurai)"]
-        JobQueue[("`job_queue` (ZSET)<br/>Score = Priority (1-10)<br/>Member = Job ID")]
-        ProcQueue[("`job_processing` (ZSET)<br/>In-flight tracker")]
+    subgraph Broker ["In-Memory Queue (Redis / Memurai)"]
+        JobQueue[("job_queue ZSET: Score=Priority, Member=Job ID")]
+        ProcQueue[("job_processing ZSET: In-flight tracker")]
     end
 
-    subgraph DispatcherService ["🚚 Outbox Dispatcher Daemon"]
-        Dispatcher["Outbox Dispatcher<br/>• Polls published_at IS NULL<br/>• Idempotent ZADD<br/>• Batches of 50"]
+    subgraph DispatcherService ["Outbox Dispatcher Daemon"]
+        Dispatcher["Outbox Dispatcher: Polls published_at IS NULL, Idempotent ZADD"]
     end
 
-    subgraph WorkerPool ["⚙️ Distributed Worker Fleet"]
-        Worker1["Worker Node 1<br/>• ZPOPMAX (Highest Priority)<br/>• Atomic FOR UPDATE claim<br/>• Heartbeat background loop"]
-        Worker2["Worker Node 2<br/>• Lease recovery daemon<br/>• Queue reconciler"]
+    subgraph WorkerPool ["Distributed Worker Fleet"]
+        Worker1["Worker Node 1: ZPOPMAX, Atomic FOR UPDATE claim, Heartbeat loop"]
+        Worker2["Worker Node 2: Lease recovery daemon, Queue reconciler"]
     end
 
     UI -->|JWT Authenticated Requests| Server
     Server --> AuthCtrl & JobCtrl
     AuthCtrl --> Users
     JobCtrl -->|1. BEGIN TRANSACTION| DBTransaction
-    DBTransaction -->|2. Insert Job & Outbox Record| Jobs & Outbox
+    DBTransaction -->|2. Insert Job and Outbox Record| Jobs & Outbox
     
     Dispatcher -->|3. Read unpublished outbox events| Outbox
     Dispatcher -->|4. ZADD job_queue priority jobId| JobQueue
-    Dispatcher -->|5. Mark published_at = NOW()| Outbox
+    Dispatcher -->|5. Mark published_at = NOW| Outbox
     
     Worker1 & Worker2 -->|6. ZPOPMAX job_queue| JobQueue
-    Worker1 -->|7. SELECT FOR UPDATE + Set claim_token & lease| Jobs
+    Worker1 -->|7. SELECT FOR UPDATE and Set claim_token and lease| Jobs
     Worker1 -->|8. Track In-Flight| ProcQueue
-    Worker1 -->|9. Periodic Lease Heartbeat (10s)| Jobs
+    Worker1 -->|9. Periodic Lease Heartbeat 10s| Jobs
     Worker1 -->|10. Final Status COMPLETED or Retry FAILED| Jobs
     Worker1 -->|11. Remove from ProcQueue| ProcQueue
 ```
